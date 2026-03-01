@@ -104,3 +104,26 @@ Respond with ONLY "yes" or "no"."""
     )
 
     return response.choices[0].message.content.strip().lower() == "yes"
+
+
+async def answer_members_question(question: str, members: list[dict]) -> str:
+    """Answer an admin's question about the community member base using members data."""
+    members_info = json.dumps(members, indent=2, ensure_ascii=False)
+
+    prompt = f"""You are an analytics assistant for the Superteam MY community. Here is the member database:
+
+{members_info}
+
+Each member has: handle, name, profession, verified_at (date they joined).
+
+The admin is asking: "{question}"
+
+Answer the question based on the member data. Be concise and useful. If the question asks for counts, breakdowns, or patterns, provide them. If the data doesn't contain enough info to answer, say so."""
+
+    response = await client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.3,
+    )
+
+    return response.choices[0].message.content.strip()

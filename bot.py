@@ -20,8 +20,8 @@ from collections import Counter
 from datetime import datetime, timezone
 
 import config
-from llm_service import validate_answers, generate_intro, summarize_messages, is_contact_query
-from db import add_member
+from llm_service import validate_answers, generate_intro, summarize_messages, is_contact_query, answer_members_question
+from db import add_member, get_member_by_handle, get_all_members
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -40,6 +40,12 @@ message_buffer: list[dict] = []
 # Authenticated admin user IDs and pending auth
 authenticated_admins: set[int] = set()
 pending_admin_auth: set[int] = set()  # users who typed /admin and need to enter password
+
+# Users who typed /verify in the verify topic and need to enter their handle
+pending_handle_check: set[int] = set()
+
+# Admins who typed /members and need to type their question
+pending_members_query: set[int] = set()
 
 QUESTIONS = [
     ("name", "What's your name?"),
@@ -377,6 +383,7 @@ async def handle_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Available commands:\n"
             "/summary — Summarize last 100 messages from General\n"
             "/stats — Show most active members\n"
+            "/members — Ask AI about the member base\n"
             "/logout — End admin session"
         )
         return
@@ -404,6 +411,7 @@ async def handle_admin_password(update: Update, context: ContextTypes.DEFAULT_TY
             "Available commands:\n"
             "/summary — Summarize last 100 messages from General\n"
             "/stats — Show most active members\n"
+            "/members — Ask AI about the member base\n"
             "/logout — End admin session"
         )
     else:
@@ -471,6 +479,55 @@ async def handle_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     total = sum(counter.values())
     text = f"Activity Stats ({total} total messages tracked)\n\n" + "\n".join(lines)
     await update.message.reply_text(text)
+
+
+async def handle_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin command (DM): ask AI about the member base."""
+    if update.effective_chat.type != "private":
+        return
+    if update.effective_user.id not in authenticated_admins:
+        await update.message.reply_text("You need to authenticate first. Use /admin")
+        return
+
+    members = get_all_members()
+    if not members:
+        await update.message.reply_text("No members in the database yet.")
+        return
+
+    # Check if question was passed inline: /members how many developers?
+    question = " ".join(context.args) if context.args else ""
+    if question:
+        await update.message.reply_text("Analyzing member data...")
+        answer = await answer_members_question(question, members)
+        await update.message.reply_text(answer)
+    else:
+        pending_members_query.add(update.effective_user.id)
+        await update.message.reply_text(
+            f"There are {len(members)} registered members.\n\n"
+            "What would you like to know about them? Type your question:"
+        )
+
+
+async def handle_members_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle the follow-up question after /members."""
+    if update.effective_chat.type != "private":
+        return
+
+    user_id = update.effective_user.id
+    if user_id not in pending_members_query:
+        return
+
+    pending_members_query.discard(user_id)
+
+    members = get_all_members()
+    await update.message.reply_text("Analyzing member data...")
+
+    try:
+        answer = await answer_members_question(update.message.text, members)
+        await update.message.reply_text(answer)
+    except Exception as e:
+        logger.error(f"Members question failed: {e}")
+        await update.message.reply_text("Something went wrong. Try again.")
 
 
 async def handle_link_safeguard(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -587,6 +644,58 @@ async def handle_contact_query(update: Update, context: ContextTypes.DEFAULT_TYP
     )
 
 
+async def handle_verify_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /verify in the verify topic — let existing users check their registration."""
+    if update.effective_chat.type not in ("group", "supergroup"):
+        return
+    if update.message.message_thread_id != config.VERIFY_TOPIC_ID:
+        return
+
+    user_id = update.effective_user.id
+    pending_handle_check.add(user_id)
+    await update.message.reply_text("Please type your Telegram handle (e.g. @yourname):")
+
+
+async def handle_handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle the handle input after /verify in the verify topic."""
+    if update.effective_chat.type not in ("group", "supergroup"):
+        return
+    if update.message.message_thread_id != config.VERIFY_TOPIC_ID:
+        return
+    if not update.message or not update.message.text:
+        return
+
+    user_id = update.effective_user.id
+    if user_id not in pending_handle_check:
+        return
+
+    pending_handle_check.discard(user_id)
+    handle = update.message.text.strip()
+
+    member = get_member_by_handle(handle)
+    if member:
+        await update.message.reply_text(
+            f"You're already registered!\n\n"
+            f"Name: {member['name']}\n"
+            f"Profession: {member['profession']}\n"
+            f"Verified: {member['verified_at'][:10]}"
+        )
+    else:
+        # Not in DB — prompt them to register via DM
+        bot_username = (await context.bot.get_me()).username
+        chat_id = update.effective_chat.id
+        keyboard = InlineKeyboardMarkup(
+            [[InlineKeyboardButton(
+                "Start Registration",
+                url=f"https://t.me/{bot_username}?start=verify_{chat_id}",
+            )]]
+        )
+        await update.message.reply_text(
+            f"{handle} is not registered yet. Click below to complete the verification process!",
+            reply_markup=keyboard,
+        )
+
+
 async def handle_setup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Admin command to discover topic thread IDs. Run /setup in each topic."""
     if update.effective_chat.type == "private":
@@ -618,6 +727,9 @@ def main():
     # Handler: /start in DM (verification deep link)
     app.add_handler(CommandHandler("start", handle_start, filters=filters.ChatType.PRIVATE))
 
+    # Handler: /verify in verify topic (existing users check registration)
+    app.add_handler(CommandHandler("verify", handle_verify_command))
+
     # Handler: /setup in group (admin tool)
     app.add_handler(CommandHandler("setup", handle_setup))
 
@@ -632,6 +744,9 @@ def main():
 
     # Handler: /stats in DM (admin only)
     app.add_handler(CommandHandler("stats", handle_stats, filters=filters.ChatType.PRIVATE))
+
+    # Handler: /members in DM (admin only)
+    app.add_handler(CommandHandler("members", handle_members, filters=filters.ChatType.PRIVATE))
 
     # Handler: admin delete link callback
     app.add_handler(CallbackQueryHandler(handle_delete_link, pattern=r"^dellink_"))
@@ -664,7 +779,16 @@ def main():
         group=4,
     )
 
-    # Handler: DM messages — admin password check first, then redo, then verification Q&A
+    # Handler: handle input after /verify in verify topic
+    app.add_handler(
+        MessageHandler(
+            filters.ChatType.GROUPS & filters.TEXT & ~filters.COMMAND,
+            handle_handle_input,
+        ),
+        group=5,
+    )
+
+    # Handler: DM messages — admin password, members question, redo, verification Q&A
     app.add_handler(
         MessageHandler(
             filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND,
@@ -675,16 +799,23 @@ def main():
     app.add_handler(
         MessageHandler(
             filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND,
-            handle_redo_answer,
+            handle_members_question,
         ),
         group=1,
     )
     app.add_handler(
         MessageHandler(
             filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND,
-            handle_dm_message,
+            handle_redo_answer,
         ),
         group=2,
+    )
+    app.add_handler(
+        MessageHandler(
+            filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND,
+            handle_dm_message,
+        ),
+        group=3,
     )
 
     logger.info("Bot starting...")

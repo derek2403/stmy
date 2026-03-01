@@ -47,5 +47,13 @@ def get_member(user_id: int) -> dict | None:
     return None
 
 
+def get_member_by_handle(handle: str) -> dict | None:
+    handle_lower = handle.lower().lstrip("@")
+    for m in _load():
+        if m["handle"].lower().lstrip("@") == handle_lower:
+            return m
+    return None
+
+
 def get_all_members() -> list[dict]:
     return _load()
