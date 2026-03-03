@@ -17,7 +17,15 @@ def _save(members: list[dict]):
         json.dump(members, f, indent=2, ensure_ascii=False)
 
 
-def add_member(user_id: int, handle: str, name: str, profession: str):
+def add_member(
+    user_id: int,
+    handle: str,
+    name: str,
+    about: str = "",
+    location: str = "",
+    fun_fact: str = "",
+    contribution: str = "",
+):
     members = _load()
 
     # Update if already exists, otherwise append
@@ -25,7 +33,10 @@ def add_member(user_id: int, handle: str, name: str, profession: str):
         if m["user_id"] == user_id:
             m["handle"] = handle
             m["name"] = name
-            m["profession"] = profession
+            m["about"] = about
+            m["location"] = location
+            m["fun_fact"] = fun_fact
+            m["contribution"] = contribution
             m["verified_at"] = datetime.now(timezone.utc).isoformat()
             _save(members)
             return
@@ -34,7 +45,10 @@ def add_member(user_id: int, handle: str, name: str, profession: str):
         "user_id": user_id,
         "handle": handle,
         "name": name,
-        "profession": profession,
+        "about": about,
+        "location": location,
+        "fun_fact": fun_fact,
+        "contribution": contribution,
         "verified_at": datetime.now(timezone.utc).isoformat(),
     })
     _save(members)

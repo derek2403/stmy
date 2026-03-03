@@ -1,13 +1,14 @@
 import logging
+import time
 from telegram import (
     Update,
-    ChatPermissions,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     ChatMemberUpdated,
 )
 from telegram.ext import (
     Application,
+    ApplicationHandlerStop,
     ChatMemberHandler,
     CallbackQueryHandler,
     CommandHandler,
@@ -21,7 +22,7 @@ from datetime import datetime, timezone
 
 import config
 from llm_service import validate_answers, generate_intro, summarize_messages, is_contact_query, answer_members_question
-from db import add_member, get_member_by_handle, get_all_members
+from db import add_member, get_member, get_member_by_handle, get_all_members
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -47,63 +48,58 @@ pending_handle_check: set[int] = set()
 # Admins who typed /members and need to type their question
 pending_members_query: set[int] = set()
 
+
+def admin_menu_keyboard() -> InlineKeyboardMarkup:
+    """Return the inline keyboard for the admin portal."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📊 Summary", callback_data="admin_summary"),
+         InlineKeyboardButton("📈 Stats", callback_data="admin_stats")],
+        [InlineKeyboardButton("👥 Members", callback_data="admin_members")],
+        [InlineKeyboardButton("🚪 Logout", callback_data="admin_logout")],
+    ])
+
+# Minimum character count for verification answers
+MIN_ANSWER_LENGTH = 10
+
+# Cooldown for verification nag messages (seconds)
+VERIFICATION_NAG_COOLDOWN = 60
+verification_nag_cooldown: dict[int, float] = {}
+
+# Track nag message IDs so we can delete them after verification
+# {user_id: [(chat_id, message_id, thread_id), ...]}
+verification_nag_messages: dict[int, list[tuple[int, int, int | None]]] = {}
+
 QUESTIONS = [
     ("name", "What's your name?"),
-    ("gender", "What's your gender?"),
+    ("about", "Who are you & what do you do?"),
     ("location", "Where are you based?"),
-    ("occupation", "What do you do?"),
-    ("fun_fact", "Tell me a fun fact about yourself!"),
+    ("fun_fact", "One fun fact about you!"),
+    ("contribution", "How are you looking to contribute to Superteam MY?"),
 ]
 
 FIELD_LABELS = {
     "name": "name",
-    "gender": "gender",
+    "about": "who you are & what you do",
     "location": "location",
-    "occupation": "what you do",
     "fun_fact": "fun fact",
+    "contribution": "how you want to contribute",
 }
 
 
-def extract_new_member(update: ChatMemberUpdated) -> int | None:
-    """Check if someone new joined the group."""
-    old = update.old_chat_member
-    new = update.new_chat_member
-
-    if old.status in ("left", "banned") and new.status in ("member", "restricted"):
-        return new.user
-    return None
-
-
-async def handle_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """When a new member joins, restrict them and prompt verification."""
-    member_update = update.chat_member
-    new_user = extract_new_member(member_update)
-    if not new_user:
+async def greet_new_member(user_id: int, display_name: str, chat_id: int, context: ContextTypes.DEFAULT_TYPE):
+    """Shared logic for handling a new member join."""
+    existing = get_member(user_id)
+    if existing:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            message_thread_id=config.VERIFY_TOPIC_ID,
+            text=(
+                f"👋 Welcome back, {existing['name']}!\n\n"
+                "✅ You're already a verified member. Enjoy the community!"
+            ),
+        )
+        logger.info(f"Returning member {display_name} ({user_id}) — already verified.")
         return
-    if new_user.is_bot:
-        return
-
-    chat_id = member_update.chat.id
-    user_id = new_user.id
-
-    # Restrict user — no permissions except reading
-    await context.bot.restrict_chat_member(
-        chat_id=chat_id,
-        user_id=user_id,
-        permissions=ChatPermissions(
-            can_send_messages=False,
-            can_send_audios=False,
-            can_send_documents=False,
-            can_send_photos=False,
-            can_send_videos=False,
-            can_send_video_notes=False,
-            can_send_voice_notes=False,
-            can_send_polls=False,
-            can_send_other_messages=False,
-            can_add_web_page_previews=False,
-            can_invite_users=False,
-        ),
-    )
 
     # Send welcome message in verify topic with inline button
     bot_username = (await context.bot.get_me()).username
@@ -111,21 +107,20 @@ async def handle_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [
             [
                 InlineKeyboardButton(
-                    "Start Verification",
+                    "✨ Start Verification",
                     url=f"https://t.me/{bot_username}?start=verify_{chat_id}",
                 )
             ]
         ]
     )
 
-    display_name = new_user.full_name
     msg = await context.bot.send_message(
         chat_id=chat_id,
         message_thread_id=config.VERIFY_TOPIC_ID,
         text=(
-            f"Welcome {display_name}! 👋\n\n"
-            "To get access to the community, please complete a quick verification.\n"
-            "Click the button below to start!"
+            f"👋 Hey {display_name}! Welcome to Superteam MY!\n\n"
+            "🔒 To unlock full access, complete a quick verification.\n"
+            "It only takes a minute — tap the button below to get started!"
         ),
         reply_markup=keyboard,
     )
@@ -138,7 +133,35 @@ async def handle_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "chat_id": chat_id,
     }
 
-    logger.info(f"New member {display_name} ({user_id}) joined, restricted and prompted.")
+    logger.info(f"New member {display_name} ({user_id}) joined, prompted to verify.")
+
+
+async def handle_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Detect new members via chat_member update (requires bot to be admin)."""
+    member_update = update.chat_member
+    old = member_update.old_chat_member
+    new = member_update.new_chat_member
+
+    if old.status not in ("left", "banned") or new.status not in ("member", "restricted"):
+        return
+
+    new_user = new.user
+    if new_user.is_bot:
+        return
+
+    await greet_new_member(new_user.id, new_user.full_name, member_update.chat.id, context)
+
+
+async def handle_new_member_service(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Fallback: detect new members via service message (works without admin)."""
+    if not update.message or not update.message.new_chat_members:
+        return
+
+    chat_id = update.effective_chat.id
+    for new_user in update.message.new_chat_members:
+        if new_user.is_bot:
+            continue
+        await greet_new_member(new_user.id, new_user.full_name, chat_id, context)
 
 
 async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -154,7 +177,18 @@ async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             chat_id = int(args[0].replace("verify_", ""))
         except ValueError:
-            await update.message.reply_text("Invalid verification link.")
+            await update.message.reply_text("❌ Invalid verification link.")
+            return
+
+        # Check if user is already registered in members.json
+        existing = get_member(user_id)
+        if existing:
+            await update.message.reply_text(
+                f"✅ Hey {existing['name']}! You're already a verified member.\n\n"
+                "No need to go through verification again — you have full access. Welcome back! 🎉"
+            )
+            # Clean up verification state if any
+            verification_state.pop(user_id, None)
             return
 
         # Check if user has a pending verification
@@ -170,21 +204,21 @@ async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         state = verification_state[user_id]
 
         if state["step"] >= len(QUESTIONS):
-            await update.message.reply_text("You've already completed verification!")
+            await update.message.reply_text("✅ You've already completed verification!")
             return
 
         # Start asking questions
         state["step"] = 0
         state["chat_id"] = chat_id
         await update.message.reply_text(
-            "Let's get you verified! I'll ask you 5 quick questions.\n\n"
-            f"**Question 1/5:** {QUESTIONS[0][1]}",
+            "🚀 Let's get you verified! I'll ask you a few quick questions.\n\n"
+            f"📝 *Question 1/{len(QUESTIONS)}:* {QUESTIONS[0][1]}",
             parse_mode="Markdown",
         )
     else:
         await update.message.reply_text(
-            "Hi! I'm the community gatekeeper bot.\n"
-            "If you've just joined the group, click the verification button in the Verify topic to get started."
+            "👋 Hey there! I'm the Superteam MY community bot.\n\n"
+            "If you've just joined the group, head over to the Verify topic and click the verification button to get started!"
         )
 
 
@@ -203,9 +237,21 @@ async def handle_dm_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if state["step"] < 0 or state["step"] >= len(QUESTIONS):
         return
 
-    # Record the answer
+    answer_text = update.message.text.strip()
+
+    # Enforce minimum character length (skip for name)
     field_name = QUESTIONS[state["step"]][0]
-    state["answers"][field_name] = update.message.text
+    if field_name != "name" and len(answer_text) < MIN_ANSWER_LENGTH:
+        label = FIELD_LABELS.get(field_name, "this")
+        await update.message.reply_text(
+            f"✏️ That's a bit too short! Please provide more detail for *{label}* "
+            f"(at least {MIN_ANSWER_LENGTH} characters).",
+            parse_mode="Markdown",
+        )
+        return
+
+    # Record the answer
+    state["answers"][field_name] = answer_text
 
     # Move to next question
     state["step"] += 1
@@ -214,12 +260,12 @@ async def handle_dm_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         q_num = state["step"] + 1
         question_text = QUESTIONS[state["step"]][1]
         await update.message.reply_text(
-            f"**Question {q_num}/5:** {question_text}",
+            f"📝 *Question {q_num}/{len(QUESTIONS)}:* {question_text}",
             parse_mode="Markdown",
         )
     else:
         # All questions answered — validate
-        await update.message.reply_text("Thanks! Let me verify your answers...")
+        await update.message.reply_text("⏳ Thanks! Let me verify your answers...")
         await process_verification(update, context, user_id)
 
 
@@ -237,9 +283,9 @@ async def process_verification(
         # Ask user to redo invalid answers
         field_names = ", ".join(FIELD_LABELS.get(f, f) for f in invalid_fields)
         await update.message.reply_text(
-            f"Some of your answers don't seem right: **{field_names}**.\n"
-            "Let's redo those. Please provide a proper answer.\n\n"
-            f"**{QUESTIONS[next(i for i, (k, _) in enumerate(QUESTIONS) if k == invalid_fields[0])][1]}**",
+            f"⚠️ Hmm, some of your answers need a redo: *{field_names}*\n\n"
+            "No worries — just give it another shot!\n\n"
+            f"📝 *{QUESTIONS[next(i for i, (k, _) in enumerate(QUESTIONS) if k == invalid_fields[0])][1]}*",
             parse_mode="Markdown",
         )
 
@@ -256,7 +302,7 @@ async def process_verification(
     await context.bot.send_message(
         chat_id=chat_id,
         message_thread_id=config.INTROS_TOPIC_ID,
-        text=f"🎉 {intro_text}",
+        text=intro_text,
     )
 
     # Save to JSON database
@@ -270,26 +316,10 @@ async def process_verification(
         user_id=user_id,
         handle=handle,
         name=answers.get("name", ""),
-        profession=answers.get("occupation", ""),
-    )
-
-    # Unrestrict user — grant full permissions
-    await context.bot.restrict_chat_member(
-        chat_id=chat_id,
-        user_id=user_id,
-        permissions=ChatPermissions(
-            can_send_messages=True,
-            can_send_audios=True,
-            can_send_documents=True,
-            can_send_photos=True,
-            can_send_videos=True,
-            can_send_video_notes=True,
-            can_send_voice_notes=True,
-            can_send_polls=True,
-            can_send_other_messages=True,
-            can_add_web_page_previews=True,
-            can_invite_users=True,
-        ),
+        about=answers.get("about", ""),
+        location=answers.get("location", ""),
+        fun_fact=answers.get("fun_fact", ""),
+        contribution=answers.get("contribution", ""),
     )
 
     # Delete verify topic message
@@ -303,9 +333,18 @@ async def process_verification(
 
     # Confirm in DM
     await update.message.reply_text(
-        "You're all set! You now have full access to the community. "
-        "Check out the Intros topic to see your introduction. Welcome aboard! 🎉"
+        "🎉 You're all set! Welcome to Superteam MY!\n\n"
+        "📝 Your intro has been posted in the Intros topic\n\n"
+        "Jump in and say hi to the community!"
     )
+
+    # Delete all nag messages for this user
+    for nag_chat_id, nag_msg_id, _ in verification_nag_messages.pop(user_id, []):
+        try:
+            await context.bot.delete_message(chat_id=nag_chat_id, message_id=nag_msg_id)
+        except Exception:
+            pass
+    verification_nag_cooldown.pop(user_id, None)
 
     # Cleanup state
     del verification_state[user_id]
@@ -330,7 +369,19 @@ async def handle_redo_answer(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     # Record the corrected answer
     current_field = redo_fields[redo_index]
-    state["answers"][current_field] = update.message.text
+    answer_text = update.message.text.strip()
+
+    # Enforce minimum character length (skip for name)
+    if current_field != "name" and len(answer_text) < MIN_ANSWER_LENGTH:
+        label = FIELD_LABELS.get(current_field, "this")
+        await update.message.reply_text(
+            f"✏️ That's a bit too short! Please provide more detail for *{label}* "
+            f"(at least {MIN_ANSWER_LENGTH} characters).",
+            parse_mode="Markdown",
+        )
+        return
+
+    state["answers"][current_field] = answer_text
     state["redo_index"] += 1
 
     if state["redo_index"] < len(redo_fields):
@@ -338,13 +389,13 @@ async def handle_redo_answer(update: Update, context: ContextTypes.DEFAULT_TYPE)
         next_field = redo_fields[state["redo_index"]]
         q_index = next(i for i, (k, _) in enumerate(QUESTIONS) if k == next_field)
         await update.message.reply_text(
-            f"**{QUESTIONS[q_index][1]}**",
+            f"📝 *{QUESTIONS[q_index][1]}*",
             parse_mode="Markdown",
         )
     else:
         # All redone — re-validate
         state["step"] = len(QUESTIONS)  # mark as complete to prevent re-entry
-        await update.message.reply_text("Thanks! Let me verify again...")
+        await update.message.reply_text("⏳ Thanks! Let me verify again...")
         await process_verification(update, context, user_id)
 
 
@@ -379,17 +430,13 @@ async def handle_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if user_id in authenticated_admins:
         await update.message.reply_text(
-            "You're already authenticated!\n\n"
-            "Available commands:\n"
-            "/summary — Summarize last 100 messages from General\n"
-            "/stats — Show most active members\n"
-            "/members — Ask AI about the member base\n"
-            "/logout — End admin session"
+            "🔐 You're already logged in!\n\nWhat would you like to do?",
+            reply_markup=admin_menu_keyboard(),
         )
         return
 
     pending_admin_auth.add(user_id)
-    await update.message.reply_text("Enter the admin password:")
+    await update.message.reply_text("🔑 Enter the admin password:")
 
 
 async def handle_admin_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -407,15 +454,11 @@ async def handle_admin_password(update: Update, context: ContextTypes.DEFAULT_TY
         authenticated_admins.add(user_id)
         logger.info(f"Admin authenticated: {update.effective_user.full_name} ({user_id})")
         await update.message.reply_text(
-            "Authenticated!\n\n"
-            "Available commands:\n"
-            "/summary — Summarize last 100 messages from General\n"
-            "/stats — Show most active members\n"
-            "/members — Ask AI about the member base\n"
-            "/logout — End admin session"
+            "✅ Authenticated! Welcome to the Admin Portal.\n\nWhat would you like to do?",
+            reply_markup=admin_menu_keyboard(),
         )
     else:
-        await update.message.reply_text("Wrong password.")
+        await update.message.reply_text("❌ Wrong password. Try again with /admin")
 
 
 async def handle_logout(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -426,9 +469,9 @@ async def handle_logout(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id in authenticated_admins:
         authenticated_admins.discard(user_id)
-        await update.message.reply_text("Logged out.")
+        await update.message.reply_text("👋 Logged out. Use /admin to log in again.")
     else:
-        await update.message.reply_text("You're not logged in.")
+        await update.message.reply_text("You're not logged in. Use /admin to get started.")
 
 
 async def handle_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -436,20 +479,20 @@ async def handle_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != "private":
         return
     if update.effective_user.id not in authenticated_admins:
-        await update.message.reply_text("You need to authenticate first. Use /admin")
+        await update.message.reply_text("🔒 You need to authenticate first. Use /admin")
         return
 
     # General topic messages have thread_id=None (or 1 in some groups)
     general_msgs = [m for m in message_buffer if m["thread_id"] is None]
     if not general_msgs:
-        await update.message.reply_text("No messages tracked from General yet. The bot only tracks messages received since it started running.")
+        await update.message.reply_text("📭 No messages tracked from General yet.\n\nThe bot only tracks messages received since it started running.")
         return
 
     last_100 = general_msgs[-100:]
-    await update.message.reply_text(f"Summarizing {len(last_100)} messages from General...")
+    await update.message.reply_text(f"⏳ Summarizing {len(last_100)} messages from General...")
 
     summary = await summarize_messages(last_100)
-    await update.message.reply_text(f"Chat Summary ({len(last_100)} messages)\n\n{summary}")
+    await update.message.reply_text(f"📊 Chat Summary ({len(last_100)} messages)\n\n{summary}")
 
 
 async def handle_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -457,11 +500,11 @@ async def handle_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != "private":
         return
     if update.effective_user.id not in authenticated_admins:
-        await update.message.reply_text("You need to authenticate first. Use /admin")
+        await update.message.reply_text("🔒 You need to authenticate first. Use /admin")
         return
 
     if not message_buffer:
-        await update.message.reply_text("No messages tracked yet.")
+        await update.message.reply_text("📭 No messages tracked yet.")
         return
 
     counter = Counter()
@@ -472,12 +515,14 @@ async def handle_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         name_map[m["user_id"]] = handle
 
     top_10 = counter.most_common(10)
+    medals = ["🥇", "🥈", "🥉"]
     lines = []
     for rank, (uid, count) in enumerate(top_10, 1):
-        lines.append(f"{rank}. {name_map[uid]} — {count} messages")
+        prefix = medals[rank - 1] if rank <= 3 else f"  {rank}."
+        lines.append(f"{prefix} {name_map[uid]} — {count} msgs")
 
     total = sum(counter.values())
-    text = f"Activity Stats ({total} total messages tracked)\n\n" + "\n".join(lines)
+    text = f"📈 Activity Leaderboard\n{'─' * 25}\n\n" + "\n".join(lines) + f"\n\n📊 Total: {total} messages tracked"
     await update.message.reply_text(text)
 
 
@@ -486,25 +531,26 @@ async def handle_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != "private":
         return
     if update.effective_user.id not in authenticated_admins:
-        await update.message.reply_text("You need to authenticate first. Use /admin")
+        await update.message.reply_text("🔒 You need to authenticate first. Use /admin")
         return
 
     members = get_all_members()
     if not members:
-        await update.message.reply_text("No members in the database yet.")
+        await update.message.reply_text("📭 No members in the database yet.")
         return
 
     # Check if question was passed inline: /members how many developers?
     question = " ".join(context.args) if context.args else ""
     if question:
-        await update.message.reply_text("Analyzing member data...")
+        await update.message.reply_text("⏳ Analyzing member data...")
         answer = await answer_members_question(question, members)
-        await update.message.reply_text(answer)
+        await update.message.reply_text(f"👥 {answer}")
     else:
         pending_members_query.add(update.effective_user.id)
         await update.message.reply_text(
-            f"There are {len(members)} registered members.\n\n"
-            "What would you like to know about them? Type your question:"
+            f"👥 There are *{len(members)}* registered members.\n\n"
+            "💬 What would you like to know about them?\nType your question below:",
+            parse_mode="Markdown",
         )
 
 
@@ -520,14 +566,86 @@ async def handle_members_question(update: Update, context: ContextTypes.DEFAULT_
     pending_members_query.discard(user_id)
 
     members = get_all_members()
-    await update.message.reply_text("Analyzing member data...")
+    await update.message.reply_text("⏳ Analyzing member data...")
 
+    back_button = InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Back to Menu", callback_data="admin_back")]])
     try:
         answer = await answer_members_question(update.message.text, members)
-        await update.message.reply_text(answer)
+        await update.message.reply_text(f"👥 {answer}", reply_markup=back_button)
     except Exception as e:
         logger.error(f"Members question failed: {e}")
-        await update.message.reply_text("Something went wrong. Try again.")
+        await update.message.reply_text("❌ Something went wrong. Try again.", reply_markup=back_button)
+
+
+async def enforce_verification(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Delete messages from unverified users and prompt them to verify."""
+    if update.effective_chat.type not in ("group", "supergroup"):
+        return
+    if not update.message:
+        return
+
+    user = update.effective_user
+    if not user:
+        return
+
+    # Allow messages in the verify topic (unverified users interact here)
+    if update.message.message_thread_id == config.VERIFY_TOPIC_ID:
+        return
+
+    # Never filter the bot's own messages
+    me = await context.bot.get_me()
+    if user.id == me.id:
+        return
+
+    # Allow group admins/creators
+    try:
+        chat_member = await context.bot.get_chat_member(update.effective_chat.id, user.id)
+        if chat_member.status in ("administrator", "creator"):
+            return
+    except Exception:
+        pass
+
+    # Check if user is verified
+    if get_member(user.id) is not None:
+        return
+
+    # UNVERIFIED — delete message
+    try:
+        await context.bot.delete_message(
+            chat_id=update.effective_chat.id,
+            message_id=update.message.message_id,
+        )
+    except Exception as e:
+        logger.error(f"Failed to delete message from unverified user {user.id}: {e}")
+
+    # Send nag with cooldown to avoid spam
+    now = time.time()
+    last_nag = verification_nag_cooldown.get(user.id, 0)
+    if now - last_nag > VERIFICATION_NAG_COOLDOWN:
+        verification_nag_cooldown[user.id] = now
+        chat_id = update.effective_chat.id
+        keyboard = InlineKeyboardMarkup(
+            [[InlineKeyboardButton(
+                "✨ Verify Now",
+                url=f"https://t.me/{me.username}?start=verify_{chat_id}",
+            )]]
+        )
+        nag_msg = await context.bot.send_message(
+            chat_id=chat_id,
+            message_thread_id=update.message.message_thread_id,
+            text=(
+                f"🔒 Hey {user.full_name}! You need to verify before you can "
+                "send messages here.\n\n"
+                "Tap below to get started — it only takes a minute!"
+            ),
+            reply_markup=keyboard,
+        )
+        # Track nag so we can delete it after verification
+        verification_nag_messages.setdefault(user.id, []).append(
+            (chat_id, nag_msg.message_id, update.message.message_thread_id)
+        )
+
+    raise ApplicationHandlerStop
 
 
 async def handle_link_safeguard(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -552,27 +670,30 @@ async def handle_link_safeguard(update: Update, context: ContextTypes.DEFAULT_TY
         message_thread_id=thread_id,
         reply_to_message_id=msg_id,
         text=(
-            "⚠️ **Link detected** — Stay safe!\n\n"
-            "• Verify the link before clicking\n"
-            "• Never share your private keys\n"
-            "• Watch out for scams and phishing\n\n"
-            "_This is an automated message to protect community members._"
+            "🛡️ *Link Detected — Stay Safe!*\n"
+            "━━━━━━━━━━━━━━━━━━━━\n\n"
+            "🔍 Verify the link before clicking\n"
+            "🔑 Never share your private keys\n"
+            "🚫 Watch out for scams & phishing\n\n"
+            "_Automated security alert_"
         ),
         parse_mode="Markdown",
     )
 
     # Forward to all authenticated admins via DM with delete button
-    keyboard = InlineKeyboardMarkup(
-        [[InlineKeyboardButton("Delete Message", callback_data=f"dellink_{chat_id}_{msg_id}")]]
-    )
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🗑️ Delete Message", callback_data=f"dellink_{chat_id}_{msg_id}")],
+    ])
     for admin_id in authenticated_admins:
         try:
             await context.bot.send_message(
                 chat_id=admin_id,
                 text=(
-                    f"Link posted by {display}\n\n"
-                    f"{update.message.text}\n\n"
-                    "Click below to delete this message if it's suspicious."
+                    f"🔗 Link Alert\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\n\n"
+                    f"👤 Posted by: {display}\n"
+                    f"💬 Message:\n{update.message.text}\n\n"
+                    "Tap below to remove this message if suspicious."
                 ),
                 reply_markup=keyboard,
             )
@@ -605,7 +726,94 @@ async def handle_delete_link(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
     except Exception as e:
         await query.edit_message_text(
-            f"{query.message.text}\n\n❌ Failed to delete: {e}",
+            f"{query.message.text}\n\n❌ Could not delete: {e}",
+        )
+
+
+async def handle_admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle admin portal button clicks."""
+    query = update.callback_query
+    user_id = query.from_user.id
+
+    if user_id not in authenticated_admins:
+        await query.answer("Session expired. Use /admin to log in again.", show_alert=True)
+        return
+
+    await query.answer()
+    action = query.data
+    back_button = InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Back to Menu", callback_data="admin_back")]])
+
+    if action == "admin_summary":
+        general_msgs = [m for m in message_buffer if m["thread_id"] is None]
+        if not general_msgs:
+            await query.edit_message_text(
+                "📭 No messages tracked from General yet.\n\nThe bot only tracks messages received since it started running.",
+                reply_markup=back_button,
+            )
+            return
+
+        last_100 = general_msgs[-100:]
+        await query.edit_message_text(f"⏳ Summarizing {len(last_100)} messages from General...")
+
+        summary = await summarize_messages(last_100)
+        await query.edit_message_text(
+            f"📊 Chat Summary ({len(last_100)} messages)\n{'━' * 25}\n\n{summary}",
+            reply_markup=back_button,
+        )
+
+    elif action == "admin_stats":
+        if not message_buffer:
+            await query.edit_message_text(
+                "📭 No messages tracked yet.",
+                reply_markup=back_button,
+            )
+            return
+
+        counter = Counter()
+        name_map = {}
+        for m in message_buffer:
+            counter[m["user_id"]] += 1
+            handle = f"@{m['username']}" if m["username"] else m["display_name"]
+            name_map[m["user_id"]] = handle
+
+        top_10 = counter.most_common(10)
+        medals = ["🥇", "🥈", "🥉"]
+        lines = []
+        for rank, (uid, count) in enumerate(top_10, 1):
+            prefix = medals[rank - 1] if rank <= 3 else f"  {rank}."
+            lines.append(f"{prefix} {name_map[uid]} — {count} msgs")
+
+        total = sum(counter.values())
+        text = f"📈 Activity Leaderboard\n{'━' * 25}\n\n" + "\n".join(lines) + f"\n\n📊 Total: {total} messages tracked"
+        await query.edit_message_text(
+            text,
+            reply_markup=back_button,
+        )
+
+    elif action == "admin_members":
+        members = get_all_members()
+        if not members:
+            await query.edit_message_text(
+                "📭 No members in the database yet.",
+                reply_markup=back_button,
+            )
+            return
+
+        pending_members_query.add(user_id)
+        await query.edit_message_text(
+            f"👥 There are *{len(members)}* registered members.\n\n"
+            "💬 What would you like to know about them?\nType your question below:",
+            parse_mode="Markdown",
+        )
+
+    elif action == "admin_logout":
+        authenticated_admins.discard(user_id)
+        await query.edit_message_text("👋 Logged out. Use /admin to log in again.")
+
+    elif action == "admin_back":
+        await query.edit_message_text(
+            "🔐 Admin Portal\n━━━━━━━━━━━━━━━━━━━━\n\nWhat would you like to do?",
+            reply_markup=admin_menu_keyboard(),
         )
 
 
@@ -640,7 +848,9 @@ async def handle_contact_query(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     await update.message.reply_text(
-        f"For all Superteam MY related questions, feel free to reach out to {config.PIC_HANDLES}!"
+        f"💡 For all Superteam MY related questions, feel free to reach out to:\n\n"
+        f"👉 {config.PIC_HANDLES}\n\n"
+        "They'll be happy to help!"
     )
 
 
@@ -653,7 +863,7 @@ async def handle_verify_command(update: Update, context: ContextTypes.DEFAULT_TY
 
     user_id = update.effective_user.id
     pending_handle_check.add(user_id)
-    await update.message.reply_text("Please type your Telegram handle (e.g. @yourname):")
+    await update.message.reply_text("🔍 Please type your Telegram handle (e.g. @yourname):")
 
 
 async def handle_handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -674,11 +884,13 @@ async def handle_handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     member = get_member_by_handle(handle)
     if member:
+        about = member.get("about", member.get("profession", "N/A"))
         await update.message.reply_text(
-            f"You're already registered!\n\n"
-            f"Name: {member['name']}\n"
-            f"Profession: {member['profession']}\n"
-            f"Verified: {member['verified_at'][:10]}"
+            f"✅ You're already registered!\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"👤 Name: {member['name']}\n"
+            f"💼 About: {about}\n"
+            f"📅 Verified: {member['verified_at'][:10]}"
         )
     else:
         # Not in DB — prompt them to register via DM
@@ -686,12 +898,13 @@ async def handle_handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE
         chat_id = update.effective_chat.id
         keyboard = InlineKeyboardMarkup(
             [[InlineKeyboardButton(
-                "Start Registration",
+                "✨ Start Registration",
                 url=f"https://t.me/{bot_username}?start=verify_{chat_id}",
             )]]
         )
         await update.message.reply_text(
-            f"{handle} is not registered yet. Click below to complete the verification process!",
+            f"❌ {handle} is not registered yet.\n\n"
+            "Tap the button below to complete verification!",
             reply_markup=keyboard,
         )
 
@@ -719,9 +932,17 @@ def main():
 
     app = Application.builder().token(config.TELEGRAM_BOT_TOKEN).build()
 
-    # Handler: detect new members
+    # Handler: detect new members (chat_member update — works when bot is admin)
     app.add_handler(
         ChatMemberHandler(handle_new_member, ChatMemberHandler.CHAT_MEMBER)
+    )
+
+    # Handler: detect new members (service message fallback — works without admin)
+    app.add_handler(
+        MessageHandler(
+            filters.StatusUpdate.NEW_CHAT_MEMBERS,
+            handle_new_member_service,
+        )
     )
 
     # Handler: /start in DM (verification deep link)
@@ -748,8 +969,20 @@ def main():
     # Handler: /members in DM (admin only)
     app.add_handler(CommandHandler("members", handle_members, filters=filters.ChatType.PRIVATE))
 
+    # Handler: admin menu button clicks
+    app.add_handler(CallbackQueryHandler(handle_admin_menu, pattern=r"^admin_"))
+
     # Handler: admin delete link callback
     app.add_handler(CallbackQueryHandler(handle_delete_link, pattern=r"^dellink_"))
+
+    # Handler: enforce verification — delete messages from unverified users
+    app.add_handler(
+        MessageHandler(
+            filters.ChatType.GROUPS & ~filters.StatusUpdate.ALL & ~filters.COMMAND,
+            enforce_verification,
+        ),
+        group=1,
+    )
 
     # Handler: link safeguard (group messages with URLs)
     app.add_handler(

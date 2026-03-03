@@ -13,10 +13,10 @@ async def validate_answers(answers: dict) -> tuple[bool, list[str]]:
     prompt = f"""You are a verification assistant for a community group. A new member has provided these answers:
 
 Name: {answers.get('name', '')}
-Gender: {answers.get('gender', '')}
+About (who they are & what they do): {answers.get('about', '')}
 Location: {answers.get('location', '')}
-Occupation: {answers.get('occupation', '')}
 Fun fact: {answers.get('fun_fact', '')}
+Contribution (how they want to contribute): {answers.get('contribution', '')}
 
 Determine if each answer is legitimate. An answer is NOT legitimate if it is:
 - Random gibberish (e.g. "asdfhjkl", "uoashfoa")
@@ -24,12 +24,12 @@ Determine if each answer is legitimate. An answer is NOT legitimate if it is:
 - Has no contextual meaning for the question asked
 - Obviously trolling
 
-An answer IS legitimate even if it's short, as long as it actually answers the question meaningfully.
+An answer IS legitimate even if it's brief, as long as it actually answers the question meaningfully.
 
 Respond in JSON format:
 {{"valid": true/false, "invalid_fields": ["field_name1", "field_name2"], "reason": "brief explanation"}}
 
-Only include field names from: name, gender, location, occupation, fun_fact"""
+Only include field names from: name, about, location, fun_fact, contribution"""
 
     response = await client.chat.completions.create(
         model="gpt-4o-mini",
@@ -43,24 +43,43 @@ Only include field names from: name, gender, location, occupation, fun_fact"""
 
 
 async def generate_intro(answers: dict) -> str:
-    """Generate a welcome intro paragraph from the verified answers."""
-    prompt = f"""Generate a warm, friendly welcome introduction for a new community member based on their answers. Keep it to 2-3 sentences max.
+    """Generate a structured welcome intro for a new community member."""
+    prompt = f"""You are writing a welcome introduction for a new member joining the Superteam MY community.
 
-Name: {answers.get('name', '')}
-Gender: {answers.get('gender', '')}
-Location: {answers.get('location', '')}
-Occupation: {answers.get('occupation', '')}
-Fun fact: {answers.get('fun_fact', '')}
+Member info:
+- Name: {answers.get('name', '')}
+- About: {answers.get('about', '')}
+- Location: {answers.get('location', '')}
+- Fun fact: {answers.get('fun_fact', '')}
+- How they want to contribute: {answers.get('contribution', '')}
 
-Use appropriate pronouns based on their gender. Format:
-"Welcome [Name]! [He/She/They] is [occupation] based in [location]. Fun fact: [fun fact about them]!"
+Write the intro following this structure. Vary the tone, wording, and emoji usage each time so it feels fresh and human — sometimes enthusiastic, sometimes chill, sometimes witty. Mix it up.
 
-Keep it natural and welcoming. Do not add any extra commentary."""
+Structure:
+Hey everyone! Let's welcome [Name] 👋
+
+[1-2 sentences about who they are and what they do, written naturally]
+
+📍 Based in [location]
+
+🧑‍🎓 Fun fact: [their fun fact]
+
+🤝 Looking to contribute by:
+• [break their contribution into bullet points if multiple ideas, or single bullet if one thing]
+
+[Short friendly closing line encouraging people to connect]
+
+Rules:
+- Use their actual name, no brackets or placeholders in the output
+- Vary your opening greeting, emoji choices, and closing line
+- Break contributions into bullet points if they mention multiple things
+- Keep it warm and community-oriented
+- Do NOT wrap in quotes or add meta-commentary"""
 
     response = await client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[{"role": "user", "content": prompt}],
-        temperature=0.7,
+        temperature=0.9,
     )
 
     return response.choices[0].message.content.strip()
@@ -114,7 +133,8 @@ async def answer_members_question(question: str, members: list[dict]) -> str:
 
 {members_info}
 
-Each member has: handle, name, profession, verified_at (date they joined).
+Each member has: handle, name, about, location, fun_fact, contribution, verified_at.
+Note: older members may have a "profession" field instead of the newer fields.
 
 The admin is asking: "{question}"
 
